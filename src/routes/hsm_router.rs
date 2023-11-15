@@ -1,8 +1,12 @@
-use crate::handlers::hsm_handler::{exchange_public_key_handler, sign_erc20_transaction_handler, sign_raw_transaction_handler};
+use crate::handlers::hsm_handler::{
+    exchange_public_key_handler, sign_erc20_transaction_handler, sign_raw_transaction_handler,
+};
 use crate::utils::jwt_auth::auth;
 use axum::middleware;
-use axum::{routing::{get, post}, Router};
-
+use axum::{
+    routing::{get, post},
+    Router,
+};
 pub fn sign_tx_routes() -> Router {
     Router::new()
         .route(

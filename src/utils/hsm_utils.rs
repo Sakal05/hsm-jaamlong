@@ -1,7 +1,8 @@
 use anyhow::Error;
 use hkdf::Hkdf;
-use p256::{EncodedPoint, PublicKey, ecdh::EphemeralSecret, ecdsa::VerifyingKey};
-use p256::ecdsa::signature::Verifier;
+use p256::{
+    ecdh::EphemeralSecret, ecdsa::signature::Verifier, ecdsa::VerifyingKey, EncodedPoint, PublicKey,
+};
 use rand_core::OsRng;
 use redis::Commands;
 use rlp::RlpStream;
@@ -17,7 +18,7 @@ use web3::{
     signing::Signature,
     transports::Http,
     types::{
-        AccessList, Address, Bytes, SignedTransaction, TransactionParameters, H160, U256, U64,
+        AccessList, Address, Bytes, SignedTransaction, TransactionParameters, H160, H256, U256, U64,
     },
 };
 const LEGACY_TX_ID: u64 = 0;
@@ -69,7 +70,14 @@ pub struct SignTx {
     pub v_key: Vec<u8>,
 }
 
-pub async fn sign_erc20(transaction: &TxBroadcastRequest) -> Result<([u8; 32], Bytes, Vec<u8>), Error> {
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignRawTxFeild {
+    pub message: [u8; 32],
+    pub r_tx: Bytes,
+    pub signature: Vec<u8>,
+}
+
+pub async fn sign_erc20(transaction: &TxBroadcastRequest) -> Result<SignRawTxFeild, Error> {
     //========== implement authorization checks
     let token_address = match &transaction.token_address {
         Some(token) => token,
@@ -116,8 +124,6 @@ pub async fn sign_erc20(transaction: &TxBroadcastRequest) -> Result<([u8; 32], B
         .abi()
         .function("transfer")
         .and_then(|function| function.encode_input(&params.into_tokens()))
-        // TODO [ToDr] SendTransactionWithConfirmation should support custom error type (so that we can return
-        // `contract::Error` instead of more generic `Error`.
         .map_err(|err| web3::Error::Decoder(format!("Error: {}", err)))?;
     let tx_p = TransactionParameters {
         nonce: Some(nonce),
@@ -146,25 +152,25 @@ pub async fn sign_erc20(transaction: &TxBroadcastRequest) -> Result<([u8; 32], B
         max_priority_fee_per_gas,
     };
     println!("Tx Param: {:#?}", &tx);
+    // init key instance
     let private_key = dotenvy::var("PRIVATE_KEY").expect("Private key must be set");
     let key = match web3::signing::SecretKey::from_str(&private_key) {
         Ok(k) => k,
         Err(err) => return Err(Error::msg(format!("Error parsing key: {}", err))),
     };
     let sign_tx = sign_raw(&tx, &key, u64::from_str(&transaction.tx.chain_id).unwrap());
-    let combined_sign_bytes = {
-        let mut combined = [0u8; 65];
-        combined[..32].copy_from_slice(&sign_tx.r.0);
-        combined[32..64].copy_from_slice(&sign_tx.s.0);
-        combined[64] = sign_tx.v as u8;
-        combined
-    };
+    let combined_sign_bytes = combined_sign_bytes(sign_tx.v, sign_tx.r, sign_tx.s);
+
     println!("Signed Tx: {:#?}", sign_tx);
-    println!("Combined Signature: {:?}", &combined_sign_bytes);
-    Ok((sign_tx.message_hash.0, sign_tx.raw_transaction, combined_sign_bytes.to_vec()))
+    let sign_tx_field = SignRawTxFeild {
+        message: sign_tx.message_hash.0,
+        r_tx: sign_tx.raw_transaction,
+        signature: combined_sign_bytes.to_vec(),
+    };
+    Ok(sign_tx_field)
 }
 
-pub async fn sign_raw_tx(transaction: &TxBroadcastRequest) -> Result<Bytes, Error> {
+pub async fn sign_raw_tx(transaction: &TxBroadcastRequest) -> Result<SignRawTxFeild, Error> {
     let actual_transfer_amount = U256::from_dec_str(&transaction.tx.value).unwrap();
     println!("Actual Transfer Amount: {}", actual_transfer_amount);
     let nonce = U256::from_dec_str(&transaction.tx.nonce).unwrap();
@@ -211,8 +217,13 @@ pub async fn sign_raw_tx(transaction: &TxBroadcastRequest) -> Result<Bytes, Erro
         Err(err) => return Err(Error::msg(format!("Error parsing key: {}", err))),
     };
     let sign_tx = sign_raw(&tx, &key, u64::from_str(&transaction.tx.chain_id).unwrap());
-    println!("Signed Tx: {:#?}", sign_tx);
-    Ok(sign_tx.raw_transaction)
+    let combined_sign_bytes = combined_sign_bytes(sign_tx.v, sign_tx.r, sign_tx.s);
+    let sign_tx_field = SignRawTxFeild {
+        message: sign_tx.message_hash.0,
+        r_tx: sign_tx.raw_transaction,
+        signature: combined_sign_bytes.to_vec(),
+    };
+    Ok(sign_tx_field)
 }
 
 fn rlp_append_legacy(tx: &TransactionParam, stream: &mut RlpStream) {
@@ -368,13 +379,13 @@ fn sign_raw(tx: &TransactionParam, sign: impl signing::Key, chain_id: u64) -> Si
 
     let signed = encode(tx, chain_id, Some(&signature));
     let transaction_hash: web3::types::H256 = signing::keccak256(signed.as_ref()).into();
-    
+
     let s: SignedTransaction = SignedTransaction {
-        message_hash: hash.clone().into(),
+        message_hash: hash.into(),
         v: signature.v,
         r: signature.r,
         s: signature.s,
-        raw_transaction: signed.clone().into(),
+        raw_transaction: signed.into(),
         transaction_hash,
     };
     println!("{:#?}", &s);
@@ -382,7 +393,7 @@ fn sign_raw(tx: &TransactionParam, sign: impl signing::Key, chain_id: u64) -> Si
 }
 
 pub fn sign_message(message: &[u8], sign: impl signing::Key) -> [u8; 65] {
-    let signature = sign.sign_message(&message).unwrap();
+    let signature = sign.sign_message(message).unwrap();
     let combined_bytes: [u8; 65] = {
         let mut combined = [0u8; 65];
         combined[..32].copy_from_slice(&signature.r.0);
@@ -393,16 +404,15 @@ pub fn sign_message(message: &[u8], sign: impl signing::Key) -> [u8; 65] {
     combined_bytes
 }
 
-pub fn recover(recovery: web3::types::Recovery) -> anyhow::Result<Address>
-{
+pub fn recover(recovery: web3::types::Recovery) -> anyhow::Result<Address> {
     // let recovery: web3::types::Recovery = recovery.into();
     let message_hash = match recovery.message {
         web3::types::RecoveryMessage::Data(ref message) => signing::hash_message(message),
         web3::types::RecoveryMessage::Hash(hash) => hash,
     };
-    let (signature, recovery_id) = recovery
-        .as_signature()
-        .ok_or(web3::Error::Recovery(signing::RecoveryError::InvalidSignature))?;
+    let (signature, recovery_id) = recovery.as_signature().ok_or(web3::Error::Recovery(
+        signing::RecoveryError::InvalidSignature,
+    ))?;
     let address = signing::recover(message_hash.as_bytes(), &signature, recovery_id)?;
     Ok(address)
 }
@@ -430,10 +440,11 @@ pub fn verify_signature(sign_tx: &SignTx) -> bool {
     // ==== signature verifying process =====
     // ========= received payload: message (tx_field), signature, verification_bytes
     let received_v_key = VerifyingKey::from_sec1_bytes(&sign_tx.v_key).unwrap();
-    println!("Received Payload: \n - Message: {:?}\n - Signature: {:?}\n", &sign_tx.message, &sign_tx.signature);
     let signature_parse = p256::ecdsa::Signature::from_slice(&sign_tx.signature).unwrap();
 
-    let stage = received_v_key.verify(&sign_tx.message, &signature_parse.clone()).is_ok();
+    let stage = received_v_key
+        .verify(&sign_tx.message, &signature_parse.clone())
+        .is_ok();
     println!("Stage of verification: {}", stage);
     stage
 }
@@ -443,14 +454,12 @@ pub fn hsm_generate_pk(origin_pk: &[u8]) -> (Vec<u8>, EphemeralSecret) {
     let hsm_pk_bytes = EncodedPoint::from(hsm_secret.public_key()).to_bytes();
     let _sk = generate_sk(origin_pk, &hsm_secret);
     println!("Generated PK HSM: {:?}", hsm_pk_bytes.to_vec());
-    
+
     (hsm_pk_bytes.to_vec(), hsm_secret)
 }
 
 pub fn generate_sk(pk_bytes: &[u8], sk_bytes: &EphemeralSecret) -> Result<Vec<u8>, anyhow::Error> {
-
-    let public = PublicKey::from_sec1_bytes(pk_bytes)
-        .expect("bob's public key is invalid!"); // In real usage, don't panic, handle this!
+    let public = PublicKey::from_sec1_bytes(pk_bytes).expect("bob's public key is invalid!");
 
     let shared_key = sk_bytes.diffie_hellman(&public);
 
@@ -464,9 +473,9 @@ pub fn generate_sk(pk_bytes: &[u8], sk_bytes: &EphemeralSecret) -> Result<Vec<u8
     let info = pk_bytes;
     // Expand the shared key using the provided info and desired output length
     let mut okm = vec![0u8; output_length];
-    let _ = hkdf.expand(&info, &mut okm);
+    let _ = hkdf.expand(info, &mut okm);
 
-    let _ : () = con.set(pk_bytes, shared.to_vec())?;
+    con.set(pk_bytes, shared.to_vec())?;
 
     // let k: Vec<u8> = con.get(pk_bytes).expect("Key value not found");
     // println!("Key is {:#?}", k);
@@ -476,3 +485,10 @@ pub fn generate_sk(pk_bytes: &[u8], sk_bytes: &EphemeralSecret) -> Result<Vec<u8
     Ok(shared.to_vec())
 }
 
+fn combined_sign_bytes(v: u64, r: H256, s: H256) -> [u8; 65] {
+    let mut combined = [0u8; 65];
+    combined[..32].copy_from_slice(&r.0);
+    combined[32..64].copy_from_slice(&s.0);
+    combined[64] = v as u8;
+    combined
+}

@@ -16,6 +16,8 @@ pub fn decrypt(obsf: &[u8], key: &[u8]) -> String {
     let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(key));
     let (nonce, ciphertext) = obsf.split_at(NonceSize::to_usize());
     let nonce = GenericArray::from_slice(nonce);
-    let plaintext = cipher.decrypt(nonce, ciphertext).expect("Error decrypting ciphertext");
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .expect("Error decrypting ciphertext");
     String::from_utf8(plaintext).unwrap()
 }
